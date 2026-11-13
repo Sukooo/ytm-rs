@@ -184,26 +184,26 @@ mod unix {
     static CLAIMED: Mutex<Option<Result<UnixListener, String>>> = Mutex::new(None);
 
     /// A directory only this user can reach, else anyone could take the launch or send
-    /// codes: `$XDG_RUNTIME_DIR`, or `ytm-rs-<uid>` in the temp dir.
+    /// codes: `$XDG_RUNTIME_DIR`, else (unset, or not private, as under `su`) `ytm-rs-<uid>`
+    /// in the temp dir.
     fn private_dir() -> Result<PathBuf, String> {
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
-        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-            Some(dir) if dir.is_absolute() => dir,
-            _ => {
-                let dir = std::env::temp_dir().join(format!("ytm-rs-{uid}"));
-                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-                    Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(format!("{}: {e}", dir.display())),
-                    _ => dir,
-                }
-            }
-        };
         // Someone else's (or a symlink) is never trusted, nor repaired.
-        let meta = std::fs::symlink_metadata(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
-            return Err(format!("{} is not a private directory", dir.display()));
+        let private =
+            |dir: &Path| std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+            && dir.is_absolute()
+            && private(&dir)
+        {
+            return Ok(dir);
         }
-        Ok(dir)
+        let dir = std::env::temp_dir().join(format!("ytm-rs-{uid}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(format!("{}: {e}", dir.display())),
+            _ if private(&dir) => Ok(dir),
+            _ => Err(format!("{} is not a private directory", dir.display())),
+        }
     }
 
     /// The socket, and the lock file whose holder owns it.
@@ -319,6 +319,8 @@ mod unix {
         #[test]
         fn one_owner() {
             let dir = std::env::temp_dir().join(format!("ytm-rs-deeplink-test-{}", std::process::id()));
+            // A failed run's leftovers, under a reused pid.
+            let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let (socket, lock) = (dir.join("jam.sock"), dir.join("jam.lock"));
 
