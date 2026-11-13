@@ -346,13 +346,7 @@ impl App {
             app.in_tray = true;
             app.tray_left_focus = false;
         };
-        let show = |app: &mut Self| {
-            if wayland {
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
-            } else {
-                app.show_window(ctx);
-            }
-        };
+        let show = |app: &mut Self| app.bring_back(ctx, wayland);
         if ctx.input(|i| i.viewport().close_requested()) && !self.exiting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             hide(self);
@@ -369,6 +363,16 @@ impl App {
         let shown = shown(self);
         if let Some(t) = &mut self.tray {
             t.set_shown(shown);
+        }
+    }
+
+    /// Someone asked for the window: the tray, or another launch. On Wayland it can't
+    /// come back by itself (see `tray_window`), so the compositor is asked for attention.
+    pub(super) fn bring_back(&mut self, ctx: &egui::Context, wayland: bool) {
+        if wayland {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        } else {
+            self.show_window(ctx);
         }
     }
 

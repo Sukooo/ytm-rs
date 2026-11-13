@@ -1,19 +1,18 @@
 //! Jam deep links: `ytm-rs://jam/CODE` and `https://grapedjuice.github.io/ytm-rs/jam/?c=CODE`.
 //!
 //! Clicking a link launches a new process with the URL as its argument. If another
-//! instance is already running, the new one hands the code over a named pipe and
-//! exits; the running instance queues it here and wakes the UI, which drains the
-//! queue with `take()` (the same pattern as `tray.rs`).
+//! instance is already running, the new one hands the code over (a named pipe on
+//! Windows, a Unix socket on Linux) and exits; the running instance queues it here and
+//! wakes the UI, which drains the queue with `take()` (the same pattern as `tray.rs`).
 
 use std::sync::Mutex;
 
 use crate::jam::normalize_code as normalize;
 
 static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// A plain later launch asked for the window (see `forward_show`).
+/// A plain later launch asked for the window (see `hand_off`).
 static SHOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// What a plain later launch sends instead of a code.
-#[cfg_attr(not(windows), allow(dead_code))]
 const SHOW_MSG: &str = "show";
 /// Older versions' updater relaunches with this: the old copy may still be exiting, so
 /// don't hand over to it. (Relaunches now wait for it to exit: see `update::wait_for_predecessor`.)
@@ -77,123 +76,281 @@ pub fn take_show() -> bool {
     SHOW.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A plain launch while another copy runs: bring that one's window up instead, so only
-/// one copy uses (and refreshes) the Google session. Two copies refreshing it apart
-/// leave one with old cookies, which Google treats as stolen and signs out. True if
-/// a running copy took it.
-pub fn forward_show() -> bool {
-    if std::env::args_os().any(|a| a == RELAUNCH_FLAG) {
-        return false;
+/// Hand this launch over to a running copy: its jam link `code`, or else (a plain
+/// launch) a request for that copy's window, so only one copy uses (and refreshes) the
+/// Google session. Two copies refreshing it apart leave one with old cookies, which
+/// Google treats as stolen and signs out. True if a running copy took it.
+pub fn hand_off(code: Option<&str>) -> bool {
+    let relaunch = code.is_none() && std::env::args_os().any(|a| a == RELAUNCH_FLAG);
+    let msg = code.unwrap_or(SHOW_MSG);
+    if !relaunch {
+        // Windows only lets a background process take the foreground when the one the
+        // user just started allows it.
+        #[cfg(windows)]
+        if code.is_none() {
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+            }
+        }
+        if forward_to_running(msg) {
+            return true;
+        }
     }
-    // Windows only lets a background process take the foreground when the one the user
-    // just started allows it.
-    #[cfg(windows)]
-    unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-    }
-    forward_to_running(SHOW_MSG)
+    // On Windows, `listen` settles who serves: the first pipe instance wins.
+    #[cfg(target_os = "linux")]
+    return unix::claim(|| !relaunch && forward_to_running(msg));
+    #[cfg(not(target_os = "linux"))]
+    false
 }
 
-/// Per-user pipe name. A dev profile (`YTM_DATA_DIR`) gets its own, so test runs
-/// never talk to the installed copy.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// One message from a later launch: show the window, or join its jam.
+#[cfg(any(windows, target_os = "linux"))]
+fn handle(msg: &str, wake: &impl Fn()) {
+    let msg = msg.trim();
+    if msg == SHOW_MSG {
+        log::info!("another launch asked for the window");
+        SHOW.store(true, std::sync::atomic::Ordering::Relaxed);
+        wake();
+        return;
+    }
+    match normalize(msg) {
+        Some(code) => {
+            log::info!("jam link received from another launch: {code}");
+            push(code);
+            wake();
+        }
+        None => log::warn!("ignored an invalid message from another launch"),
+    }
+}
+
+/// A dev profile (`YTM_DATA_DIR`) gets its own pipe or socket, so test runs never talk
+/// to the installed copy.
+#[cfg(any(windows, target_os = "linux"))]
+fn profile_suffix() -> String {
+    use std::hash::{Hash, Hasher};
+    std::env::var_os("YTM_DATA_DIR")
+        .map(|dir| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            dir.hash(&mut h);
+            format!("-{:016x}", h.finish())
+        })
+        .unwrap_or_default()
+}
+
+/// Per-user pipe name.
+#[cfg(windows)]
 fn pipe_name() -> String {
     let user: String = std::env::var("USERNAME")
         .unwrap_or_default()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    let mut name = format!(r"\\.\pipe\ytm-rs-jam-{user}");
-    if let Some(dir) = std::env::var_os("YTM_DATA_DIR") {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        dir.hash(&mut h);
-        name.push_str(&format!("-{:016x}", h.finish()));
-    }
-    name
+    format!(r"\\.\pipe\ytm-rs-jam-{user}{}", profile_suffix())
 }
 
 #[cfg(windows)]
-pub use win::{forward_to_running, listen, register_protocol};
+use win::forward_to_running;
+#[cfg(windows)]
+pub use win::{listen, register_protocol};
 
-/// Per-user socket path. A dev profile (`YTM_DATA_DIR`) gets its own, so test runs
-/// never talk to the installed copy — the same rule as `pipe_name` on Windows.
-#[cfg(not(windows))]
-fn socket_path() -> std::path::PathBuf {
-    let user: String = std::env::var("USER")
-        .unwrap_or_default()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let mut name = format!("ytm-rs-jam-{user}");
-    if let Some(dir) = std::env::var_os("YTM_DATA_DIR") {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        dir.hash(&mut h);
-        name.push_str(&format!("-{:016x}", h.finish()));
-    }
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    dir.join(name).with_extension("sock")
+#[cfg(target_os = "linux")]
+use unix::forward_to_running;
+#[cfg(target_os = "linux")]
+pub use unix::listen;
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn forward_to_running(_msg: &str) -> bool {
+    false
 }
 
-#[cfg(not(windows))]
-pub fn forward_to_running(code: &str) -> bool {
-    use std::io::Write;
-    match std::os::unix::net::UnixStream::connect(socket_path()) {
-        Ok(mut stream) => stream.write_all(format!("{code}\n").as_bytes()).and_then(|()| stream.flush()).is_ok(),
-        // Nobody is listening: no running copy, or a socket a crash left behind.
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(windows))]
-pub fn listen(wake: impl Fn() + Send + 'static) {
-    use std::io::{BufRead, Read};
-
-    let path = socket_path();
-    // A live copy would have taken the launch, so anything here is stale.
-    let _ = std::fs::remove_file(&path);
-    let listener = match std::os::unix::net::UnixListener::bind(&path) {
-        Ok(listener) => listener,
-        Err(e) => {
-            log::warn!("single-instance socket: {e}");
-            return;
-        }
-    };
-    let spawned = std::thread::Builder::new().name("deeplink".into()).spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            // One line per launch, capped like the Windows pipe.
-            let mut msg = String::new();
-            if let Err(e) = std::io::BufReader::new(stream.take(257)).read_line(&mut msg) {
-                log::warn!("single-instance socket: {e}");
-                continue;
-            }
-            let msg = msg.trim();
-            if msg == SHOW_MSG {
-                log::info!("another launch asked for the window");
-                SHOW.store(true, std::sync::atomic::Ordering::Relaxed);
-                wake();
-                continue;
-            }
-            match normalize(msg) {
-                Some(code) => {
-                    log::info!("jam link received from another launch: {code}");
-                    push(code);
-                    wake();
-                }
-                None => log::warn!("single-instance socket: ignored an invalid message"),
-            }
-        }
-    });
-    if let Err(e) = spawned {
-        log::warn!("single-instance listener: {e}");
-    }
-}
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn listen(_wake: impl Fn() + Send + 'static) {}
 
 #[cfg(not(windows))]
 pub fn register_protocol() {}
+
+#[cfg(target_os = "linux")]
+mod unix {
+    use std::fs::File;
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// The socket `claim` bound, for `listen` to serve; or why there is none.
+    static CLAIMED: Mutex<Option<Result<UnixListener, String>>> = Mutex::new(None);
+
+    /// A directory only this user can reach, else anyone could take the launch or send
+    /// codes: `$XDG_RUNTIME_DIR`, or `ytm-rs-<uid>` in the temp dir.
+    fn private_dir() -> Result<PathBuf, String> {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            Some(dir) if dir.is_absolute() => dir,
+            _ => {
+                let dir = std::env::temp_dir().join(format!("ytm-rs-{uid}"));
+                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                    Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(format!("{}: {e}", dir.display())),
+                    _ => dir,
+                }
+            }
+        };
+        // Someone else's (or a symlink) is never trusted, nor repaired.
+        let meta = std::fs::symlink_metadata(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+            return Err(format!("{} is not a private directory", dir.display()));
+        }
+        Ok(dir)
+    }
+
+    /// The socket, and the lock file whose holder owns it.
+    fn paths() -> Result<(PathBuf, PathBuf), String> {
+        let dir = private_dir()?;
+        let stem = format!("ytm-rs-jam{}", super::profile_suffix());
+        Ok((dir.join(format!("{stem}.sock")), dir.join(format!("{stem}.lock"))))
+    }
+
+    /// Hand `msg` to a running instance. True if one took it.
+    pub fn forward_to_running(msg: &str) -> bool {
+        let Ok((socket, _)) = paths() else { return false };
+        // Fails when nobody listens: no running copy, or a socket a crash left behind.
+        UnixStream::connect(socket).and_then(|mut s| s.write_all(format!("{msg}\n").as_bytes())).is_ok()
+    }
+
+    /// Become the copy later launches hand over to: before logging, threads and the
+    /// window, so two launches at once can't both start. Whoever holds the lock owns the
+    /// socket, until it exits (a crash included). While another copy holds it but isn't
+    /// listening yet, keep offering it this launch through `forward`. True if it took it.
+    pub fn claim(forward: impl Fn() -> bool) -> bool {
+        let claimed = paths().and_then(|(socket, lock)| claim_at(&socket, &lock, Duration::from_secs(10), forward));
+        let listener = match claimed {
+            Ok(None) => return true,
+            Ok(Some((listener, lock))) => {
+                // Held until exit. Child processes don't inherit it: std opens close-on-exec.
+                std::mem::forget(lock);
+                Ok(listener)
+            }
+            // Logged by `listen`, once logging is up; this copy runs on its own.
+            Err(e) => Err(e),
+        };
+        *CLAIMED.lock().unwrap() = Some(listener);
+        false
+    }
+
+    /// `claim` at these paths: the listener and the held lock, or `None` if `forward`
+    /// handed the launch over.
+    fn claim_at(socket: &Path, lock: &Path, patience: Duration, forward: impl Fn() -> bool) -> Result<Option<(UnixListener, File)>, String> {
+        let file =
+            File::options().create(true).truncate(false).write(true).open(lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+        let deadline = Instant::now() + patience;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => return Err(format!("{}: {e}", lock.display())),
+            }
+            if forward() {
+                return Ok(None);
+            }
+            if Instant::now() > deadline {
+                return Err("another copy holds the socket but isn't listening".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The lock is ours, so a socket file here is one a crash left behind.
+        let _ = std::fs::remove_file(socket);
+        let listener = UnixListener::bind(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+        Ok(Some((listener, file)))
+    }
+
+    /// Serve the socket `claim` bound on a background thread: each message is handled
+    /// and `wake` called.
+    pub fn listen(wake: impl Fn() + Send + 'static) {
+        let listener = match CLAIMED.lock().unwrap().take() {
+            Some(Ok(listener)) => listener,
+            Some(Err(e)) => {
+                log::warn!("single-instance socket: {e}");
+                return;
+            }
+            None => return,
+        };
+        let spawned = std::thread::Builder::new().name("deeplink".into()).spawn(move || serve(listener, wake));
+        if let Err(e) = spawned {
+            log::warn!("single-instance listener: {e}");
+        }
+    }
+
+    fn serve(listener: UnixListener, wake: impl Fn()) {
+        for stream in listener.incoming() {
+            let stream = match stream {
+                Ok(stream) => stream,
+                // E.g. out of file descriptors: don't spin.
+                Err(e) => {
+                    log::warn!("single-instance socket: {e}");
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            };
+            // A launch that connects and stalls mustn't hold up the next ones.
+            if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(1))) {
+                log::warn!("single-instance socket: {e}");
+                continue;
+            }
+            // One line per launch, capped like the Windows pipe.
+            let mut msg = String::new();
+            match std::io::BufReader::new(stream.take(257)).read_line(&mut msg) {
+                Ok(_) => super::handle(&msg, &wake),
+                Err(e) => log::warn!("single-instance socket: {e}"),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn send(socket: &Path, msg: &str) -> bool {
+            UnixStream::connect(socket).and_then(|mut s| s.write_all(format!("{msg}\n").as_bytes())).is_ok()
+        }
+
+        #[test]
+        fn one_owner() {
+            let dir = std::env::temp_dir().join(format!("ytm-rs-deeplink-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (socket, lock) = (dir.join("jam.sock"), dir.join("jam.lock"));
+
+            // A socket file a crashed copy left behind doesn't stop the next one.
+            drop(UnixListener::bind(&socket).unwrap());
+            let (listener, held) = claim_at(&socket, &lock, Duration::ZERO, || false).unwrap().unwrap();
+
+            // A launch while it runs can't take the socket over: it hands over, or
+            // (nobody listening) gives up rather than unlinking it.
+            assert!(claim_at(&socket, &lock, Duration::from_secs(1), || send(&socket, SHOW)).unwrap().is_none());
+            assert!(claim_at(&socket, &lock, Duration::ZERO, || false).is_err());
+
+            // A launch that connects and stalls doesn't hold up the next.
+            let _stalled = UnixStream::connect(&socket).unwrap();
+            assert!(send(&socket, SHOW));
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || serve(listener, move || tx.send(()).unwrap()));
+            for _ in 0..2 {
+                rx.recv_timeout(Duration::from_secs(5)).expect("both launches handled");
+            }
+            assert!(crate::deeplink::take_show());
+
+            // The lock goes with the process, so the next copy takes over.
+            drop(held);
+            assert!(claim_at(&socket, &lock, Duration::ZERO, || false).unwrap().is_some());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Not a jam code: the queue test shares the queue.
+        const SHOW: &str = crate::deeplink::SHOW_MSG;
+    }
+}
 
 #[cfg(windows)]
 mod win {
@@ -208,7 +365,7 @@ mod win {
     use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
     use windows::core::HSTRING;
 
-    use super::{normalize, pipe_name, push};
+    use super::pipe_name;
 
     /// Hand `code` to a running instance. True if one took it.
     pub fn forward_to_running(code: &str) -> bool {
@@ -295,20 +452,7 @@ mod win {
             unsafe {
                 let _ = DisconnectNamedPipe(pipe.0);
             }
-            if String::from_utf8_lossy(&msg).trim() == super::SHOW_MSG {
-                log::info!("another launch asked for the window");
-                super::SHOW.store(true, std::sync::atomic::Ordering::Relaxed);
-                wake();
-                continue;
-            }
-            match normalize(String::from_utf8_lossy(&msg).trim()) {
-                Some(code) => {
-                    log::info!("jam link received from another launch: {code}");
-                    push(code);
-                    wake();
-                }
-                None => log::warn!("jam link pipe: ignored an invalid message"),
-            }
+            super::handle(&String::from_utf8_lossy(&msg), &wake);
         }
     }
 

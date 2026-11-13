@@ -96,16 +96,16 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     }
-    // A jam link (`ytm-rs://jam/CODE` or the https share link): hand it to the running
-    // instance if there is one, else join once this one is up. Before `init_logging`,
-    // which would truncate the running instance's log file.
-    if let Some(code) = deeplink::from_args() {
-        if deeplink::forward_to_running(&code) {
-            return Ok(());
-        }
-        deeplink::push(code);
-    } else if deeplink::forward_show() {
+    // A running instance takes this launch: its jam link (`ytm-rs://jam/CODE` or the
+    // https share link), or else shows its window. Otherwise join once this one is up.
+    // Before `init_logging`, which would truncate the running instance's log file, and
+    // before any thread starts.
+    let code = deeplink::from_args();
+    if deeplink::hand_off(code.as_deref()) {
         return Ok(());
+    }
+    if let Some(code) = code {
+        deeplink::push(code);
     }
     init_logging();
     settle_window_system();
@@ -176,7 +176,7 @@ fn main() -> eframe::Result {
                 }
             };
 
-            // Jam links from later launches arrive over a pipe (first instance only).
+            // Later launches hand over to the first instance (see `deeplink::hand_off`).
             deeplink::listen(wake);
             // Keep `ytm-rs:` links pointing at this copy; dev builds leave it alone
             // (even with YTM_UPDATE_FORCE).
